@@ -78,8 +78,8 @@ class MockUpstream(BaseHTTPRequestHandler):
         self.wfile.write(chunk)
 
 
-def _fetch(port, path, range_header=None, if_none_match=None):
-    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
+def _fetch(port, path, range_header=None, if_none_match=None, method=None):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
     if range_header:
         req.add_header("Range", range_header)
     if if_none_match:
@@ -248,6 +248,19 @@ class RangeCacheProxyTest(unittest.TestCase):
         probes_before = MockUpstream.hit_count["n"]
         _fetch(self.port, "/__health")
         self.assertEqual(probes_before + 1, MockUpstream.hit_count["n"], "every probe call must hit upstream fresh, TTL 0")
+
+    def test_health_probe_answers_plain_head_request(self):
+        # EarthStatus.reach()-style callers send a plain HTTP HEAD with no
+        # body expected; MINECRAFT-571 55789/55808/55816/55820 established
+        # that /__health must answer that the same way GET does.
+        status, headers, body = _fetch(self.port, "/__health", method="HEAD")
+        self.assertEqual(200, status)
+        self.assertEqual(b"", body)
+
+    def test_health_probe_head_reflects_upstream_outage(self):
+        MockUpstream.fail_next["n"] = 999
+        status, _headers, _body = _fetch(self.port, "/__health", method="HEAD")
+        self.assertEqual(503, status)
 
     def test_ordinary_data_path_unaffected_by_probe_policy(self):
         _fetch(self.port, "/__health")

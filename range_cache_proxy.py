@@ -359,6 +359,23 @@ def make_handler(proxy: RangeCacheProxy):
         def log_message(self, fmt, *args):
             pass
 
+        def do_HEAD(self):
+            # EarthStatus.reach()-style callers send a plain HEAD with no
+            # body expected; /__health must answer that the same way GET
+            # does (status only, TTL 0, never the ordinary data cache) or a
+            # correctly-behaving proxy would fail a HEAD-based health probe
+            # with a 501 from BaseHTTPRequestHandler's default dispatch.
+            if self.path == "/__health":
+                ok = proxy.probe_upstream()
+                self.send_response(200 if ok else 503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self):
             import json
             if self.path == "/__stats":
