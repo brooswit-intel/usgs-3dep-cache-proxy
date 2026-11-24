@@ -208,13 +208,29 @@ class _SingleFlight:
         return flight.result
 
 
+#: Defensive ceiling on a single read when the expected size isn't known
+#: up front (an open-ended range, or a 200 answering a range request that
+#: should never be trusted/read in full anyway). Matches the order of
+#: magnitude of a single COG block (CopernicusSource.MAX_BLOCK_BYTES is
+#: 8 MiB) with headroom, not the size of a whole mosaic file.
+_UNBOUNDED_READ_SAFETY_CAP = 64 * 1024 * 1024
+
+
 def _fetch_range(upstream_base: str, upstream_path: str, start: Optional[int], end: Optional[int],
                   timeout: float, retries: int):
     """GETs exactly one byte range (or the whole object if start is None) from
     the fixed upstream. Returns (status, etag, content_range, body). Raises
     UpstreamError on network failure, a non-2xx status, or a truncated body
     (declared Content-Length not matching the bytes actually received) --
-    none of those are ever treated as cacheable success by the caller."""
+    none of those are ever treated as cacheable success by the caller.
+
+    Status is always checked BEFORE any body is read: a HEAD-like decision
+    (404/403/416, or a 200 answering what should have been a 206) happens
+    off headers alone, with no read at all. For a genuine 206, the read is
+    capped to the exact declared size (defensively ceilinged) rather than
+    an unbounded `.read()` -- a misbehaving upstream that ignores Range on
+    a multi-GB object (HRDEM mosaics are 1-10 GB) must never be read into
+    memory in full just to discover it isn't a 206."""
     parsed = urllib.parse.urlsplit(upstream_base)
     full_path = parsed.path.rstrip("/") + "/" + upstream_path.lstrip("/")
     headers = {"User-Agent": "minecraft-577-regional-elevation-cache/1"}
@@ -229,27 +245,40 @@ def _fetch_range(upstream_base: str, upstream_path: str, start: Optional[int], e
         try:
             conn.request("GET", full_path, headers=headers)
             resp = conn.getresponse()
-            body = resp.read()
             status = resp.status
             if status in (404, 403, 416):
                 # Genuine upstream "not found" / "forbidden" / out-of-bounds
-                # range -- passed through verbatim, never cached, never
-                # retried as if it were a transient failure.
-                return status, None, resp.getheader("Content-Range"), b""
+                # range -- decided off headers alone, no body read at all;
+                # passed through verbatim, never cached, never retried as
+                # if it were a transient failure.
+                content_range = resp.getheader("Content-Range")
+                resp.read()  # drain on this connection before it's closed
+                return status, None, content_range, b""
             if status not in (200, 206):
+                resp.read()
                 last_exc = UpstreamError(f"HTTP {status} for {full_path}")
                 continue
+            if start is not None and status != 206:
+                # Asked for a range but upstream answered 200: never trust or
+                # read this as the requested range. Read only a small capped
+                # prefix (never the full, possibly huge, object) purely to
+                # drain the connection before closing it, then fail the
+                # attempt exactly as before.
+                resp.read(_UNBOUNDED_READ_SAFETY_CAP)
+                last_exc = UpstreamError(f"requested range but upstream returned {status} for {full_path}")
+                continue
             declared = resp.getheader("Content-Length")
+            # Bound the read to what was declared (a legitimate 206/200 for
+            # the exact request made), with a defensive ceiling regardless --
+            # never an unbounded .read() driven solely by a remote-controlled
+            # Content-Length.
+            cap = min(int(declared), _UNBOUNDED_READ_SAFETY_CAP) if declared is not None else _UNBOUNDED_READ_SAFETY_CAP
+            body = resp.read(cap)
             if declared is not None and int(declared) != len(body):
                 last_exc = UpstreamError(f"truncated transfer for {full_path}: declared {declared}, got {len(body)}")
                 continue
             etag = resp.getheader("ETag")
             content_range = resp.getheader("Content-Range")
-            if start is not None and status != 206:
-                # Asked for a range but upstream silently sent the whole
-                # object: never slice/trust this as the requested range.
-                last_exc = UpstreamError(f"requested range but upstream returned {status} for {full_path}")
-                continue
             return status, etag, content_range, body
         except OSError as net_err:
             last_exc = net_err
