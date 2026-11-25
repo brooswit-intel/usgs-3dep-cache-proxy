@@ -219,23 +219,15 @@ _UNBOUNDED_READ_SAFETY_CAP = 64 * 1024 * 1024
 _CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(?:\d+|\*)$")
 
 
-def _content_range_matches(content_range: Optional[str], start: int, end: Optional[int]) -> bool:
-    """A 206's Content-Range must echo back the exact range requested -- an
-    upstream that returns the right length but the WRONG bytes (a different
-    offset entirely) is otherwise indistinguishable from a correct reply by
-    length alone, and would be cached and served under the requested key as
-    if it were the right data."""
+def _parse_content_range(content_range: Optional[str]):
+    """Returns (start, end) inclusive from a Content-Range header, or None
+    if absent/unparseable."""
     if content_range is None:
-        return False
+        return None
     m = _CONTENT_RANGE_RE.match(content_range)
     if not m:
-        return False
-    got_start, got_end = int(m.group(1)), int(m.group(2))
-    if got_start != start:
-        return False
-    if end is not None and got_end != end:
-        return False
-    return True
+        return None
+    return int(m.group(1)), int(m.group(2))
 
 
 def _fetch_range(upstream_base: str, upstream_path: str, start: Optional[int], end: Optional[int],
@@ -300,15 +292,35 @@ def _fetch_range(upstream_base: str, upstream_path: str, start: Optional[int], e
                 last_exc = UpstreamError(f"truncated transfer for {full_path}: declared {declared}, got {len(body)}")
                 continue
             content_range = resp.getheader("Content-Range")
-            if status == 206 and start is not None and not _content_range_matches(content_range, start, end):
-                # A 206 with the right length but the WRONG bytes (a
-                # different offset entirely) is otherwise indistinguishable
-                # from a correct reply by length alone -- never cache or
-                # serve this under the requested key.
-                last_exc = UpstreamError(
-                    f"Content-Range {content_range!r} does not match requested bytes {start}-{end} for {full_path}"
-                )
-                continue
+            if status == 206 and start is not None:
+                parsed_range = _parse_content_range(content_range)
+                if parsed_range is None:
+                    last_exc = UpstreamError(f"missing/unparseable Content-Range {content_range!r} for {full_path}")
+                    continue
+                got_start, got_end = parsed_range
+                if got_start != start or (end is not None and got_end != end):
+                    # A 206 with the right length but the WRONG bytes (a
+                    # different offset entirely) is otherwise
+                    # indistinguishable from a correct reply by length
+                    # alone -- never cache or serve this under the
+                    # requested key.
+                    last_exc = UpstreamError(
+                        f"Content-Range {content_range!r} does not match requested bytes {start}-{end} for {full_path}"
+                    )
+                    continue
+                expected_len = got_end - got_start + 1
+                if len(body) != expected_len:
+                    # Correct offsets, wrong actual byte count -- e.g. a
+                    # connection cut short with no (or a matching-but-wrong)
+                    # Content-Length header, which the earlier declared-
+                    # length check alone would miss whenever Content-Length
+                    # is absent. The range interval itself is the ground
+                    # truth for how many bytes this reply must contain.
+                    last_exc = UpstreamError(
+                        f"body length {len(body)} does not match range interval {expected_len} "
+                        f"({content_range!r}) for {full_path}"
+                    )
+                    continue
             etag = resp.getheader("ETag")
             return status, etag, content_range, body
         except OSError as net_err:

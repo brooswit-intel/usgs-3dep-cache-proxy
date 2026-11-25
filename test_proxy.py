@@ -27,6 +27,7 @@ class MockUpstream(BaseHTTPRequestHandler):
     fail_next = {"n": 0}
     serve_whole_on_range = {"on": False}
     serve_wrong_offset_206 = {"on": False}
+    serve_short_body_206 = {"on": False}
 
     def log_message(self, fmt, *args):
         pass
@@ -84,6 +85,21 @@ class MockUpstream(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(chunk)
             return
+        if MockUpstream.serve_short_body_206["on"]:
+            # Misbehaving/truncated upstream: correct Content-Range
+            # coordinates, no Content-Length, but fewer actual bytes than
+            # that range interval implies (connection cut short). Only
+            # distinguishable by comparing actual byte count against the
+            # range interval itself, never by a declared-Content-Length
+            # check alone (there is none here to check).
+            chunk = OBJECT[start:end + 1][:-1] or b"X"
+            self.send_response(206)
+            self.send_header("ETag", ETAG)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(OBJECT)}")
+            self.close_connection = True
+            self.end_headers()
+            self.wfile.write(chunk)
+            return
         chunk = OBJECT[start:end + 1]
         self.send_response(206)
         self.send_header("ETag", ETAG)
@@ -112,6 +128,7 @@ class RangeCacheProxyTest(unittest.TestCase):
         MockUpstream.fail_next["n"] = 0
         MockUpstream.serve_whole_on_range["on"] = False
         MockUpstream.serve_wrong_offset_206["on"] = False
+        MockUpstream.serve_short_body_206["on"] = False
         self.mock = HTTPServer(("127.0.0.1", 0), MockUpstream)
         self.mock_port = self.mock.server_address[1]
         threading.Thread(target=self.mock.serve_forever, daemon=True).start()
@@ -207,6 +224,28 @@ class RangeCacheProxyTest(unittest.TestCase):
         status, _headers, _body = _fetch(self.port, PATH, range_header="bytes=0-9")
         self.assertEqual(502, status)
         self.assertEqual(0, self.proxy.cache.total_bytes(), "a Content-Range mismatch must never be cached")
+
+    def test_short_body_with_correct_coordinates_never_cached_then_recovers(self):
+        # Correct Content-Range coordinates, no Content-Length, but fewer
+        # actual bytes than the range interval implies: a declared-length
+        # check alone (there is no declared length here) would miss this.
+        MockUpstream.serve_short_body_206["on"] = True
+        status, _headers, _body = _fetch(self.port, PATH, range_header="bytes=0-9")
+        self.assertEqual(502, status, "a short body must be a retryable failure, not success")
+        self.assertEqual(0, self.proxy.cache.total_bytes(), "a short body must never be cached")
+
+        MockUpstream.serve_short_body_206["on"] = False
+        hits_before = MockUpstream.hit_count["n"]
+        status, _headers, body = _fetch(self.port, PATH, range_header="bytes=0-9")
+        self.assertEqual(206, status)
+        self.assertEqual(OBJECT[0:10], body)
+        self.assertGreater(MockUpstream.hit_count["n"], hits_before)
+
+        hits_before = MockUpstream.hit_count["n"]
+        status, _headers, body = _fetch(self.port, PATH, range_header="bytes=0-9")
+        self.assertEqual(206, status)
+        self.assertEqual(OBJECT[0:10], body)
+        self.assertEqual(hits_before, MockUpstream.hit_count["n"], "the recovered data must now warm-hit")
 
     def test_concurrent_miss_deduplication_single_flight(self):
         barrier_hits_before = MockUpstream.hit_count["n"]
