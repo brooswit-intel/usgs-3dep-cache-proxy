@@ -26,6 +26,7 @@ class MockUpstream(BaseHTTPRequestHandler):
     hit_count = {"n": 0}
     fail_next = {"n": 0}
     serve_whole_on_range = {"on": False}
+    serve_wrong_offset_206 = {"on": False}
 
     def log_message(self, fmt, *args):
         pass
@@ -69,6 +70,20 @@ class MockUpstream(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(OBJECT)
             return
+        if MockUpstream.serve_wrong_offset_206["on"]:
+            # Misbehaving upstream: a 206 with the right length but the
+            # WRONG bytes -- a different offset entirely, shifted by 10.
+            # Only distinguishable from a correct reply by checking
+            # Content-Range, never by length alone.
+            wrong_start, wrong_end = start + 10, end + 10
+            chunk = OBJECT[wrong_start:wrong_end + 1]
+            self.send_response(206)
+            self.send_header("ETag", ETAG)
+            self.send_header("Content-Range", f"bytes {wrong_start}-{wrong_end}/{len(OBJECT)}")
+            self.send_header("Content-Length", str(len(chunk)))
+            self.end_headers()
+            self.wfile.write(chunk)
+            return
         chunk = OBJECT[start:end + 1]
         self.send_response(206)
         self.send_header("ETag", ETAG)
@@ -96,6 +111,7 @@ class RangeCacheProxyTest(unittest.TestCase):
         MockUpstream.hit_count["n"] = 0
         MockUpstream.fail_next["n"] = 0
         MockUpstream.serve_whole_on_range["on"] = False
+        MockUpstream.serve_wrong_offset_206["on"] = False
         self.mock = HTTPServer(("127.0.0.1", 0), MockUpstream)
         self.mock_port = self.mock.server_address[1]
         threading.Thread(target=self.mock.serve_forever, daemon=True).start()
@@ -183,6 +199,14 @@ class RangeCacheProxyTest(unittest.TestCase):
         status, _headers, _body = _fetch(self.port, PATH, range_header="bytes=0-9")
         self.assertEqual(502, status)
         self.assertEqual(0, self.proxy.cache.total_bytes(), "never cache a range reply upstream didn't actually honor")
+
+    def test_wrong_offset_206_never_cached_or_served(self):
+        # Right length, wrong bytes (shifted by 10): length alone can't
+        # distinguish this from a correct reply -- only Content-Range can.
+        MockUpstream.serve_wrong_offset_206["on"] = True
+        status, _headers, _body = _fetch(self.port, PATH, range_header="bytes=0-9")
+        self.assertEqual(502, status)
+        self.assertEqual(0, self.proxy.cache.total_bytes(), "a Content-Range mismatch must never be cached")
 
     def test_concurrent_miss_deduplication_single_flight(self):
         barrier_hits_before = MockUpstream.hit_count["n"]

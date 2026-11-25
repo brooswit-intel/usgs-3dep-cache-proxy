@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import http.client
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -215,6 +216,27 @@ class _SingleFlight:
 #: 8 MiB) with headroom, not the size of a whole mosaic file.
 _UNBOUNDED_READ_SAFETY_CAP = 64 * 1024 * 1024
 
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(?:\d+|\*)$")
+
+
+def _content_range_matches(content_range: Optional[str], start: int, end: Optional[int]) -> bool:
+    """A 206's Content-Range must echo back the exact range requested -- an
+    upstream that returns the right length but the WRONG bytes (a different
+    offset entirely) is otherwise indistinguishable from a correct reply by
+    length alone, and would be cached and served under the requested key as
+    if it were the right data."""
+    if content_range is None:
+        return False
+    m = _CONTENT_RANGE_RE.match(content_range)
+    if not m:
+        return False
+    got_start, got_end = int(m.group(1)), int(m.group(2))
+    if got_start != start:
+        return False
+    if end is not None and got_end != end:
+        return False
+    return True
+
 
 def _fetch_range(upstream_base: str, upstream_path: str, start: Optional[int], end: Optional[int],
                   timeout: float, retries: int):
@@ -277,8 +299,17 @@ def _fetch_range(upstream_base: str, upstream_path: str, start: Optional[int], e
             if declared is not None and int(declared) != len(body):
                 last_exc = UpstreamError(f"truncated transfer for {full_path}: declared {declared}, got {len(body)}")
                 continue
-            etag = resp.getheader("ETag")
             content_range = resp.getheader("Content-Range")
+            if status == 206 and start is not None and not _content_range_matches(content_range, start, end):
+                # A 206 with the right length but the WRONG bytes (a
+                # different offset entirely) is otherwise indistinguishable
+                # from a correct reply by length alone -- never cache or
+                # serve this under the requested key.
+                last_exc = UpstreamError(
+                    f"Content-Range {content_range!r} does not match requested bytes {start}-{end} for {full_path}"
+                )
+                continue
+            etag = resp.getheader("ETag")
             return status, etag, content_range, body
         except OSError as net_err:
             last_exc = net_err
