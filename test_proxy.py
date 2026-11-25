@@ -28,6 +28,7 @@ class MockUpstream(BaseHTTPRequestHandler):
     serve_whole_on_range = {"on": False}
     serve_wrong_offset_206 = {"on": False}
     serve_short_body_206 = {"on": False}
+    serve_unproven_short_end_206 = {"on": False}
 
     def log_message(self, fmt, *args):
         pass
@@ -85,6 +86,21 @@ class MockUpstream(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(chunk)
             return
+        if MockUpstream.serve_unproven_short_end_206["on"]:
+            # Misbehaving upstream: ends the response early (before the
+            # requested end) but with an unknown total ('*') -- nothing
+            # proves this is the real EOF rather than a truncated
+            # mid-file cut. Must be rejected, unlike a numeric total that
+            # actually proves EOF.
+            short_end = start + max(0, (end - start) // 2)
+            chunk = OBJECT[start:short_end + 1]
+            self.send_response(206)
+            self.send_header("ETag", ETAG)
+            self.send_header("Content-Range", f"bytes {start}-{short_end}/*")
+            self.send_header("Content-Length", str(len(chunk)))
+            self.end_headers()
+            self.wfile.write(chunk)
+            return
         if MockUpstream.serve_short_body_206["on"]:
             # Misbehaving/truncated upstream: correct Content-Range
             # coordinates, no Content-Length, but fewer actual bytes than
@@ -129,6 +145,7 @@ class RangeCacheProxyTest(unittest.TestCase):
         MockUpstream.serve_whole_on_range["on"] = False
         MockUpstream.serve_wrong_offset_206["on"] = False
         MockUpstream.serve_short_body_206["on"] = False
+        MockUpstream.serve_unproven_short_end_206["on"] = False
         self.mock = HTTPServer(("127.0.0.1", 0), MockUpstream)
         self.mock_port = self.mock.server_address[1]
         threading.Thread(target=self.mock.serve_forever, daemon=True).start()
@@ -246,6 +263,28 @@ class RangeCacheProxyTest(unittest.TestCase):
         self.assertEqual(206, status)
         self.assertEqual(OBJECT[0:10], body)
         self.assertEqual(hits_before, MockUpstream.hit_count["n"], "the recovered data must now warm-hit")
+
+    def test_requested_end_beyond_eof_with_proven_total_is_accepted(self):
+        # Requesting an end past the real object size (a legitimate shape:
+        # the client doesn't always know the exact file size up front) must
+        # be accepted when the upstream's Content-Range proves the shorter
+        # end really is EOF via a numeric total -- never rejected as a
+        # Content-Range mismatch just because got_end < requested end.
+        past_eof = len(OBJECT) + 500
+        status, headers, body = _fetch(self.port, PATH, range_header=f"bytes=0-{past_eof}")
+        self.assertEqual(206, status)
+        self.assertEqual(OBJECT, body)
+        self.assertEqual(f"bytes 0-{len(OBJECT) - 1}/*", headers["Content-Range"])
+
+    def test_unproven_short_end_206_never_cached_or_served(self):
+        # A 206 that ends early with an UNKNOWN total ('*') proves nothing
+        # about EOF -- indistinguishable from a truncated mid-file cut, so
+        # it must be rejected exactly like one, not treated as a
+        # legitimate shorter reply.
+        MockUpstream.serve_unproven_short_end_206["on"] = True
+        status, _headers, _body = _fetch(self.port, PATH, range_header="bytes=0-19")
+        self.assertEqual(502, status)
+        self.assertEqual(0, self.proxy.cache.total_bytes())
 
     def test_concurrent_miss_deduplication_single_flight(self):
         barrier_hits_before = MockUpstream.hit_count["n"]

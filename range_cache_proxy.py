@@ -216,18 +216,20 @@ class _SingleFlight:
 #: 8 MiB) with headroom, not the size of a whole mosaic file.
 _UNBOUNDED_READ_SAFETY_CAP = 64 * 1024 * 1024
 
-_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(?:\d+|\*)$")
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
 
 
 def _parse_content_range(content_range: Optional[str]):
-    """Returns (start, end) inclusive from a Content-Range header, or None
-    if absent/unparseable."""
+    """Returns (start, end, total) from a Content-Range header -- start/end
+    inclusive, total an int or None when the upstream sent '*' (unknown
+    total) -- or None if the header is absent/unparseable."""
     if content_range is None:
         return None
     m = _CONTENT_RANGE_RE.match(content_range)
     if not m:
         return None
-    return int(m.group(1)), int(m.group(2))
+    total = None if m.group(3) == "*" else int(m.group(3))
+    return int(m.group(1)), int(m.group(2)), total
 
 
 def _fetch_range(upstream_base: str, upstream_path: str, start: Optional[int], end: Optional[int],
@@ -297,13 +299,21 @@ def _fetch_range(upstream_base: str, upstream_path: str, start: Optional[int], e
                 if parsed_range is None:
                     last_exc = UpstreamError(f"missing/unparseable Content-Range {content_range!r} for {full_path}")
                     continue
-                got_start, got_end = parsed_range
-                if got_start != start or (end is not None and got_end != end):
-                    # A 206 with the right length but the WRONG bytes (a
-                    # different offset entirely) is otherwise
-                    # indistinguishable from a correct reply by length
-                    # alone -- never cache or serve this under the
-                    # requested key.
+                got_start, got_end, got_total = parsed_range
+                # A shorter-than-requested end is only legitimate when a
+                # numeric total proves it's the real end of the object (the
+                # object is shorter than the requested end) -- never on an
+                # unknown total ('*'), which proves nothing. Anything else
+                # (a different start entirely, or a short end with no
+                # proof) is a 206 that must not be cached/served under the
+                # requested key: it is otherwise indistinguishable from a
+                # correct reply by length alone.
+                end_ok = (
+                    end is None
+                    or got_end == end
+                    or (got_end < end and got_total is not None and got_total == got_end + 1)
+                )
+                if got_start != start or not end_ok:
                     last_exc = UpstreamError(
                         f"Content-Range {content_range!r} does not match requested bytes {start}-{end} for {full_path}"
                     )
@@ -398,7 +408,13 @@ class RangeCacheProxy:
 
         headers = {"ETag": etag or "", "Accept-Ranges": "bytes"}
         if start is not None:
-            resolved_end = end if end is not None else start + len(body) - 1
+            # Always the TRUE end of what's actually being returned, never
+            # the client's originally requested end: a request for bytes
+            # past the object's real EOF is answered with fewer bytes than
+            # asked (proven by upstream's own Content-Range total), and the
+            # client-facing header must describe what's actually in body,
+            # not repeat back a request that was never fully satisfied.
+            resolved_end = start + len(body) - 1
             headers["Content-Range"] = f"bytes {start}-{resolved_end}/*"
             return 206, headers, body
         return 200, headers, body
